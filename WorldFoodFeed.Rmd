@@ -1,0 +1,616 @@
+---
+title: "World Food Production"
+author: "Martin Oberg"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Intro
+This is an analysis of the _World Food and Feed Production_.  While I am not trained in global food systems, this report shows a few ideas of the kinds of questions that could be asked of these data.
+
+
+# Data Organization and Cleaning
+```{r}
+library(tidyverse)
+library(broom)
+```
+
+```{r}
+data_path = "D:/data/world-foodfeed-prduction/FAO.csv"
+col_spec = cols(
+  .default = col_double(),
+  `Area Abbreviation` = col_character(),
+  Area = col_character(),
+  Item = col_character(),
+  Element = col_character(),
+  Unit = col_character()
+)
+data = read_csv(data_path, col_names = TRUE, col_types = col_spec, locale(encoding = 'UTF-8'))
+```
+
+```{r}
+# ggplot is having trouble with UTF.  Renaming for quick fix
+data$Area[data$`Area Code` == 107] = "Cote d'Ivore"
+```
+
+
+## Data cleaning and organization
+
+First, we make some convenience tibbles that relate the various codes to their data value.  Using the codes could be useful shortcuts for joining tables.
+```{r}
+countries = 
+  data %>% 
+  select(Area, `Area Abbreviation`, `Area Code`, latitude, longitude) %>% 
+  group_by(Area, `Area Abbreviation`, `Area Code`) %>% 
+  distinct() %>% 
+  ungroup()
+elements = 
+  data %>% 
+  select(Element, `Element Code`) %>% 
+  group_by(Element, `Element Code`) %>% 
+  unique()
+items = 
+  data %>% 
+  select(Item, `Item Code`) %>% 
+  group_by(Item, `Item Code`) %>% 
+  ungroup() %>% 
+  unique()
+units = 
+  data %>% 
+  select(Unit) %>% 
+  unique()
+```
+
+
+```{r}
+units %>% pull()
+```
+As we see below there is only one value for Unit.  This frees us from having to do any unit conversions to make comparisons.  We will drop this column and remember what unit the data are in.
+
+Here we see that there are fewer Item Codes than Item labels.
+```{r}
+items %>%
+  select(Item) %>% 
+  distinct() %>% 
+  nrow()
+```
+Here we look for duplicate _Item_ labels.
+```{r}
+items %>%
+  group_by(Item) %>% 
+  nest() %>% 
+  mutate(n = map_int(data, nrow)) %>% 
+  filter(n>1) %>% 
+  unnest(cols = data)
+```
+There might be a reason for the duplicate Item label, but without knowing more about the data we will combine these item codes to remove the duplicate _Item_ name.
+```{r}
+# Two ways of cleaning
+data$`Item Code`[data$Item == 'Eggs'] = 2744
+data$`Item Code`[data$`Item Code` == 2948] = 2848
+# Remake the table
+items = 
+  data %>% 
+  select(Item, `Item Code`) %>% 
+  group_by(Item, `Item Code`) %>% 
+  ungroup() %>% 
+  unique()
+
+```
+
+
+
+```{r}
+countries %>%
+  count(`Area Abbreviation`) %>% 
+  arrange(desc(n)) %>% 
+  left_join(countries) 
+```
+It looks like there are abbreviation errors for Bahamas and Macedonia.  I will also leave the 4 areas of China as they are.
+```{r}
+# Bahamas BS
+# The former Yugoslav Republic of Macedonia MK
+data$`Area Abbreviation`[data$`Area Code` == 12] = "BS"
+data$`Area Abbreviation`[data$`Area Code` == 154] = "MK"
+# Remake the table
+countries = 
+  data %>% 
+  select(Area, `Area Abbreviation`, `Area Code`, latitude, longitude) %>% 
+  group_by(Area, `Area Abbreviation`, `Area Code`) %>% 
+  distinct() %>% 
+  ungroup()
+```
+For this project I will be using the term "country" to refer to the geographical entities in the Area column.  While it may be incorrect in some cases, the purpose of this project is to demonstrate what can be done with this type of data and not to inform policy or make geo-political statements. A more detailed analysis about specific areas would require more sensitivity to terminology.
+
+
+
+
+We will need to reshape the data into a long format.
+```{r}
+# Here we rename the year columns to be used in a long tibble.  Dropping NAs means that Countries will have different year entries.
+data_long = 
+  data %>% 
+  rename_with( ~ gsub("Y", "", .x, fixed = TRUE)) %>%   # Remove "Y" from year columns
+  select(`Area Code`, Area, `Item Code`, Item, Element, starts_with('19'), starts_with('20')) %>% 
+  pivot_longer(
+    cols = matches('[12]'),  # select 1XXX and 2XXX column names
+    names_to = 'Year', 
+    values_drop_na = TRUE)
+
+data_long$Year = as.numeric(data_long$Year)
+```
+
+```{r}
+head(data_long)
+```
+We have kept the _Area Code_ and _Item Code_ columns to save on typing during data exploration.
+
+
+
+# Describing the data
+
+
+## Element and Item overlap 
+
+First we will look at how Items are distributed across the Food/Feed Element category.
+```{r}
+item_by_element = 
+  data_long %>% 
+  select(Item, Element) %>% 
+  distinct() %>% 
+  group_by(Element) %>% 
+  nest() %>% 
+  mutate(N_Items = map_int(data, nrow))
+item_by_element %>% 
+  select(-data)
+```
+
+This table shows that there is considerable overlap between _Food_ and _Feed_ categories.  An _Item_ can be classified as _Food_ and _Feed_.  This is something to keep in mind as we progress through the analysis.
+
+
+## Number of Items by Country   
+
+How many different Items do countries produce? 
+```{r}
+count_data =
+  data_long %>% 
+  filter(value > 0) %>% 
+  group_by(Area, Element, Item) %>% 
+  summarise(x = sum(value)) %>% 
+  nest() %>% 
+  mutate(N_Items = map_int(data, nrow))
+#count_data
+```
+
+Let's have a look at the distribution of number of _Items_ each country produces.
+```{r}
+count_data %>% 
+  ggplot(aes(x=N_Items, fill=Element)) +
+  geom_histogram(alpha=0.5,  position="identity") +
+  xlab("Number of Distinct Items Produced")
+```
+
+Countries generally produce a small number of _Feed_ items and a large number of _Food_ items.  This could be partially explained by there being fewer _Feed_ items overall.  Another explanation could be that feed crops are more regionally specific.     
+
+
+Now we can ask if there is a relationship between the number of Items produced and total production.  We will look at average yearly production because countries have different amounts of yearly data.
+```{r}
+total_production_by_country = 
+  data_long %>% 
+  group_by(Area) %>% 
+  summarise(`Average Production` = mean(value))
+
+count_data %>% 
+  select(-data) %>% 
+  pivot_wider(names_from = Element, values_from = N_Items) %>% 
+  replace_na(list(Feed=0, Food=0)) %>% 
+  right_join(total_production_by_country) %>% ungroup() %>% 
+  mutate(quantile_rank = ntile(total_production_by_country$`Average Production`,2),
+         quantile_rank = recode(quantile_rank, `1`="Below Median", `2`="Above Median")) %>% 
+  ggplot(aes(x=Food, y=Feed)) +
+  geom_point(aes(color = factor(quantile_rank))) +
+  scale_color_discrete(name="Total production\nrelative to global median")+
+  labs(x = "N Food Items", y = "N Feed Items")
+```
+
+This scatter plot shows the number of Feed and Food Items produced by country and is color coded based on the total production relative to the global (median) average.  Again we see that countries produce more kinds of Food items than Feed items.  While no clear division exists between countries above and below median production, countries with more production produce more distinct Items.  
+
+We could follow up to see how countries around median production differ with some having more variety in terms of number of Items.  
+
+Another relationship to look in to could be number of Items produced and land area.  More space could simply provide more varied conditions for more types of production.  Also, whether a country is land locked could have a large effect on what it can produce.  Furthermore, there is currently no categorization of whether the item is a crop, secondary item (butter, beer, oil, etc.), or sea/fisheries based.  
+
+
+## Amount of Feed and Food
+
+Now we will look more closely at the amounts of production and not numbers of distinct items.
+
+```{r}
+# Determine top 5 yearly producers
+top5 = 
+  data_long %>% 
+  group_by(Area, Element) %>% 
+  summarise(Amount = sum(value)) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = Element, values_from = Amount) %>% 
+  mutate(TotFF = map2_dbl(Feed, Food, sum)) %>% 
+  slice_max(order_by = TotFF, n=5) %>% 
+  mutate(Label = Area) %>% 
+  select(Area, Label)
+
+data_long %>% 
+  group_by(Area, Element) %>% 
+  summarise(Amount = sum(value)) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = Element, values_from = Amount) %>% 
+  mutate(Feed = Feed / 1000,
+         Food = Food / 1000) %>% 
+  left_join(top5) %>% 
+    ggplot(aes(Feed, Food, label=Label)) +
+    geom_point()+
+    #coord_equal()+
+    geom_text(vjust = "center", hjust="right", check_overlap = FALSE) +
+    xlab("Feed Production (M tons)") + # unit was originally per 1000 tonnes, and values scaled above by another 1/1000
+    ylab("Food Production (M tons)") +
+    geom_abline(intercept = 0, linetype="dotted")
+```
+
+This graph shows all countries and their total yearly Feed and Food production with top 5 overall producers labeled.  The dotted line shows equal Food and Feed values.  No country has produced drastically more Feed than Food.  We should also look at average yearly production.
+
+```{r}
+top5avg = 
+  data_long %>% 
+  group_by(Area, Element, Year) %>% 
+    summarise(yearSum = sum(value)) %>% 
+  ungroup() %>% 
+  group_by(Area, Element) %>% 
+    summarise(yearAvg = mean(yearSum)) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = Element, values_from = yearAvg) %>% 
+  mutate(TotFF = map2_dbl(Feed, Food, sum)) %>% 
+  slice_max(order_by = TotFF, n=5) %>% 
+  mutate(Label = Area) %>% 
+  select(Area, Label)
+
+data_long %>% 
+  group_by(Area, Element, Year) %>% 
+    summarise(yearSum = sum(value)) %>% 
+  ungroup() %>% 
+  group_by(Area,Element) %>% 
+    summarise(yearAvg = mean(yearSum)) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = Element, values_from = yearAvg) %>% 
+  mutate(Feed = Feed / 1000,
+         Food = Food / 1000) %>% 
+  left_join(top5avg) %>% 
+    ggplot(aes(x=Feed, y=Food, label=Label)) +
+    geom_point()+
+    #coord_equal()+
+    geom_text(vjust = "center", hjust="right", check_overlap = FALSE) +
+    xlab("Feed Production (M tons)") + # unit was originally per 1000 tonnes, and values scaled above by another 1/1000
+    ylab("Food Production (M tons)") +
+    geom_abline(intercept = 0, linetype="dotted")
+```
+
+This looks nearly the same except the data are scaled by the number of years each country has been recorded.
+There are many interpretations that food systems experts could draw from this.  For now, let's look at how this Food-Feed relationship changes over time.
+
+
+
+## Percent of production as Feed
+
+Instead of plotting Feed against Food we can calculate Feed as a percent of the total.
+Because _Feed_ presumably refers to livestock feed and is used as an "input" for production, we will compute percent of production as feed ( _Percent Feed_ ) rather than percent as food which, while statistically valid, would gloss over this relationship.  With yearly data we can compute the _Percent Feed_ over time to look for long term trends.
+```{r}
+ratio_data = 
+  data_long %>% 
+  group_by(Area, Year, Element) %>% 
+  summarize(Value = sum(value, na.rm=T)) %>% 
+  pivot_wider(names_from = Element, values_from = Value) %>% 
+  mutate('Percent Feed' = Feed / (Feed + Food) * 100,
+         'Total Production' = Feed + Food) 
+
+head(ratio_data)
+  
+```
+
+
+
+
+Now we can now check if there are other trends in _Percent Feed_ over time.  We will fit a linear model for each country that predicts _Percent Feed_ as a function of _Year_.  These trends would certainly be tied to societal, government, climate, and other factors which could have short term or long term effects and would be analyzed in conjunction with other data. 
+```{r}
+country_model = function(df) { 
+  lm(`Percent Feed`~ Year, data = df)
+}
+
+model_data =
+  ratio_data %>% 
+  # We are making one model per country
+  group_by(Area) %>% 
+  nest() %>% 
+  mutate(model  = map(data, country_model), 
+         tidy   = map(model, broom::tidy),
+         glance = map(model, broom::glance),
+         rsq    = map_dbl(glance, "r.squared"),
+         #augment= map(model, broom::augment),
+         Sl  = map(tidy, "estimate"),
+         Slope_pctFeed = map_dbl(Sl, 2)) %>% 
+  select(Area, data, rsq, Slope_pctFeed) %>% 
+  ungroup()
+head(model_data)
+```
+
+The slope of the model represents how much on average _Percent Feed_ changes over time.  $R^2$ (rsq) is a measure of how closely the data follow that trend, with 1 being a perfect fit and 0 representing no relation to the model at all.
+
+```{r}
+model_data %>% 
+  select(Slope_pctFeed) %>% 
+  ggplot( aes(x=Slope_pctFeed)) +
+  geom_histogram() +
+  xlab("Model Slope") +
+  ylab("Count")
+```
+
+Here we see that model slope is normally distributed with most countries having near 0 slope, i.e. no relationship between _Percent Feed_ and _Year_.  Positive and negative slopes correspond to _Percent Feed_ increasing and decreasing over time.
+
+
+Let us have a look at the countries that have the largest changes over time.
+```{r}
+model_data %>%
+  select(Area, Slope_pctFeed, rsq) %>% 
+  arrange(desc(abs(Slope_pctFeed))) %>% 
+  head()
+```
+Looking at $R^2$, we see that some models are good (Tajikistan) and others are not so great (Serbia and Turkmenistan).  Graphing some of these will provide some insight.
+
+```{r}
+model_data %>% 
+  arrange(desc(Slope_pctFeed)) %>% 
+  head() %>% 
+  select(Area, data, rsq, Slope_pctFeed) %>% 
+  unnest(data) %>% 
+  ggplot(aes(x=Year, y=`Percent Feed`, color =Area)) +
+  #ggtitle(Area[[1]]) +
+  #facet_grid(vars(Area)) +
+  geom_point(aes(color=Area)) +
+  geom_line() +
+  theme_bw()
+```
+
+Here we see that Turkmenistan had a drop in Percent Feed around 1995.  Let us have a closer look.
+```{r}
+ratio_data %>% 
+  filter(Area == "Turkmenistan") %>% 
+  select(-`Percent Feed`, -`Total Production`) %>% 
+  pivot_longer(cols = starts_with('F'), names_to = "Element" ) %>% 
+  ggplot(aes(x=Year, y=value, group=Element, color=Element)) +
+  geom_line() +
+  ggtitle("Turkmenistan")
+```
+
+Here we see that the drop in _Percent Feed_ is from a drop in Feed production, and not an increase in Food, which has seen steady increases.
+
+
+Now we will discuss how good all of the models are.
+```{r}
+model_data %>% 
+  select(rsq) %>% 
+  ggplot( aes(x=rsq)) +
+  geom_histogram(bins=11, boundary=T) +
+  scale_x_continuous(breaks=seq(0,1.,0.1))+
+  xlab("Model Fit (R^2)") +
+  ylab("Count")
+```
+The histogram above shows that model fit as evaluated by $R^2$ is generally evenly, i.e. uniformly, distributed with only 2 countries showing a near 'perfect' fit.  Of course, looking at a single linear model ignores year by year changes that could be the result of many different factors.  
+
+### The best fit are not always informative ####
+After looking at countries showing the largest changes we can also look at the models with the best fit.
+```{r}
+model_data %>% 
+  filter(rsq>0.9) %>% 
+  arrange(desc(rsq)) %>% 
+  unnest(cols=c(data)) %>% 
+  ggplot(aes(x=Year, y=`Percent Feed`, color=Area)) +
+  geom_point(aes(color=Area)) +
+  geom_line() +
+  theme_bw()
+```
+The countries with the best fit models are not particularly ground breaking.  There are only 2 years of data for Sudan which makes for a limited model.  Lesotho is more interesting as it has Percent Feed values that are highly correlated with Year. However, he range of values between 0 and 5% show that Feed has never been a large production area.  Comparing this to the previous plots with _Percent Feed_ ranging from 0 to 40, the range for Lesotho is nearly an order of magnitude less.
+
+
+
+### Focus on Good Models ############
+
+
+For now let us focus on models with a reasonably good fit.
+```{r}
+good_model_data = 
+  model_data %>% 
+  filter(abs(rsq) > 0.6)
+```
+
+
+
+
+```{r}
+good_model_data %>% 
+  arrange(desc(Slope_pctFeed)) %>% 
+  head() %>% 
+  #filter(Area == 'Tajikistan') %>% 
+  select(Area, data, rsq, Slope_pctFeed) %>% 
+  unnest(data) %>% 
+  ggplot(aes(x=Year, y=`Percent Feed`, color =Area)) +
+  geom_point(aes(color=Area)) +
+  geom_line() +
+  ggtitle("Countries with increasing Percent Feed")+
+  theme_bw()
+```
+
+
+```{r}
+good_model_data %>% 
+  arrange(-desc(Slope_pctFeed)) %>% 
+  head() %>% 
+  #filter(Area == 'Tajikistan') %>% 
+  select(Area, data, rsq, Slope_pctFeed) %>% 
+  unnest(data) %>% 
+  ggplot(aes(x=Year, y=`Percent Feed`, color =Area)) +
+  geom_point(aes(color=Area)) +
+  geom_line() +
+  ggtitle("Countries with decreasing Percent Feed")+
+  theme_bw()
+```
+
+From these figures we can surmise that the _Percent Feed_ variable captures how tied the two categories of production are.
+
+
+We should also model Total Production over time.
+
+
+
+
+## Analysis of Top Producers
+
+
+Which countries are the biggest producers of which crops?  Here we consider a country to be a top producer of an _Item_ if it has been among the top 3 producers for any year.
+```{r}
+top_producers = 
+  data_long %>% 
+  group_by(Item, `Item Code`, Year)  %>% 
+  slice_max(value, n=3, with_ties = FALSE) %>% 
+  ungroup() %>% 
+  group_by(`Item Code`, Item) %>% 
+  distinct(Area) %>% 
+  ungroup()
+
+
+top_producers
+```
+
+Now we can look at how many _Items_ a country is a producer of.
+```{r}
+top_producers %>% 
+  select(Area) %>% 
+  count(Area) %>% 
+  arrange(desc(n))
+```
+
+This makes it easy to find what countries are top producers of only 1 _Item_.
+```{r}
+top_producers %>% 
+  select(Area) %>% 
+  count(Area) %>% 
+  arrange(desc(n)) %>% 
+  filter(n == 1) %>% 
+  left_join(top_producers) %>% 
+  select(-n)
+```
+
+We can also look at what _Items_ a single country is a top producer of.
+```{r}
+top_producers %>% 
+  select(Area) %>% 
+  count(Area) %>% 
+  arrange(desc(n)) %>% 
+  filter(Area == "Canada") %>% 
+  left_join(top_producers) %>% 
+  select(-n)
+```
+
+
+Another question is what percent of world production is accounted for by the top producers.
+```{r}
+# How much do the top producers make?
+data_top_producers = 
+  data_long %>% 
+  group_by(`Item Code`) %>% 
+  inner_join(top_producers) %>% 
+  summarise(top = sum(value, na.rm=TRUE))
+# How much of each item is made?
+all_production =
+  data_long %>% 
+  group_by(`Item Code`) %>% 
+  summarise(`Total Units` = sum(value, na.rm=TRUE))
+# 
+top_production = 
+  data_top_producers %>% 
+  left_join(all_production) %>% 
+  left_join(items) %>% 
+  mutate(pct_top = top/`Total Units`*100) %>% 
+  arrange(pct_top)
+#top_production %>% 
+#  select(-top, -`Total Units`)
+```
+The value of _pct_top_ represents how much of the world production is produced by countries that have been among the top 3 producers over time.  This is a measure of how concentrated world wide production is.
+
+
+The following table shows the top produced _Items_ and the percent production accounted for by the top producers.
+```{r}
+top_production %>% 
+  slice_max(order_by = `Total Units`, n=6) %>% 
+  select(-top)
+```
+No item is completely dominated by the top producers, however, maize and products comes the closest with 57% of production accounted for by top producers.  Top global production takes effort from many people.
+
+
+Now we look at which items are produced by few countries.
+```{r}
+top_production %>% 
+  slice_max(order_by = pct_top, n=10) %>% 
+  select(-top)
+```
+These are all quite small compared to the top producers.  Sweet potatoes, at 6 million (1000 ton) units, is still only 1/3 that of the smallest top produced item in the previous table.
+
+
+Now a look at the Items that are produced the least by the top producers.
+```{r}
+top_production %>% 
+  slice_min(order_by = pct_top, n=10) %>% 
+  select(-top)
+```
+This table shows which items are produced the least by the top producers, loosely meaning items that are most uniformly produced by all countries. 
+
+Some patterns that I see are that Milk and Offals are lowest on this list.  This could be because they are perishable and not easily exported.  There are probably food systems patterns that can be seen from this table, especially in conjunction with import/export data.
+
+
+
+
+# End
+
+
+This document shows how to get started with the World Food and Feed data set.  There are many more directions to follow with a little guidance from some domain knowledge.
+I hope I have shown some novel ideas to some readers and helped raise new directions for analysis to others.
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
